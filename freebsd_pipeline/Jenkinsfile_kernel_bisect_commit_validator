@@ -1,0 +1,140 @@
+#!/usr/bin/env groovy
+
+def PowerShellWrapper(psCmd) {
+	println "${psCmd}"
+	psCmd = psCmd.replaceAll("\r", "").replaceAll("\n", "")
+	bat "powershell.exe -NonInteractive -ExecutionPolicy Bypass -Command \"\$ErrorActionPreference='Stop';[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;$psCmd;EXIT \$global:LastExitCode\""
+}
+
+
+
+properties ([
+    overrideIndexTriggers(false),
+    [$class: 'ParametersDefinitionProperty',
+        parameterDefinitions: [
+        [$class: 'ChoiceParameterDefinition',
+            choices: 'https://github.com/freebsd/freebsd.git',
+            name: 'KERNEL_GIT_URL',
+            description: 'Linux kernel repository'],
+        [$class: 'StringParameterDefinition',
+            name: 'KERNEL_GIT_BRANCH',
+            defaultValue: 'master',
+            description: 'Kernel repo branch name'],
+        [$class: 'StringParameterDefinition',
+            name: 'KERNEL_GIT_COMMIT_ID',
+            defaultValue: 'HEAD',
+            description: 'Kernel repo commit id'],
+        [$class: 'ChoiceParameterDefinition',
+            choices: 'Boot\n',
+            name: 'BISECT_TYPE',
+            description: 'Type of bisect that will be performed.']
+        ]
+    ]
+])
+
+
+//env.BUILD_NAME = 'b'
+
+isPerf = BISECT_TYPE.equals('Performance')
+isBootTest = BISECT_TYPE.equals('Boot')
+isFunc = BISECT_TYPE.equals('Functional')
+
+
+// this is the main logic
+build_kernel()
+
+if (isBootTest) {
+	boot_test()
+}
+
+if (isPerf) {
+//TODO
+}
+
+if (isFunc) {
+//TODO
+}
+
+
+
+def getCode() {
+	def ci_exists = fileExists 'CI'
+	if (!ci_exists){
+		new File('CI').mkdir()
+	}
+	dir ('CI') {
+		cleanWs()              
+		git poll: false, changelog: false, url: 'https://github.com/xian123/bis-pipeline.git', branch: 'test'                     
+	}
+	
+	def BIS_exists = fileExists 'BIS'
+	if (!BIS_exists){
+		new File('BIS').mkdir()
+	}
+	dir ('BIS') {
+		cleanWs()
+		git poll: false, changelog: false, url: 'https://github.com/xian123/BIS.git', branch: 'dev'       
+	}
+	
+	def BIN_exists = fileExists 'BIN'
+	if (!BIN_exists){
+		new File('BIN').mkdir()
+	}
+	dir ('BIN') {
+		cleanWs()
+		git poll: false, changelog: false, url: 'https://github.com/xian123/CITest.git', branch: 'master'       
+	}
+}
+
+def build_kernel() {
+    node("bis_bisect") {
+
+        stage('build_kernel') {
+				echo 'Getting code...'
+				getCode()
+				
+                echo 'Running LISA...'
+                result = 'SUCCESS'
+                try {
+					PowerShellWrapper( ".\\CI\\scripts\\lis_hyperv_platform\\RunLisa.ps1 -vmName freebsdcurrentbisect -hvServer localhost -suiteTest debug -DebugCases BuildKernel  -kernelGitBranch ${KERNEL_GIT_BRANCH} -kernelCommitID ${KERNEL_GIT_COMMIT_ID} ")
+					echo 'Finished running LISA.'
+                } catch (exc) {
+                    println "LISA failed, will now archive logs and exit."
+                    result = 'FAILURE'
+                } finally {
+					junit "BIS\\WS2012R2\\lisa\\report.xml"
+                    currentBuild.result = result
+                }
+        }
+    }
+}
+
+
+
+def boot_test() {
+    node("bis_bisect") {
+
+        stage('boot_test') {
+				echo 'Getting code...'
+				getCode()
+				
+                echo 'Running LISA...'
+                result = 'SUCCESS'
+                try {
+                    PowerShellWrapper(".\\CI\\scripts\\lis_hyperv_platform\\RunLisa.ps1 -vmName freebsdcurrentbisect -hvServer localhost -suiteTest debug -DebugCases Heartbeat")
+                    echo 'Finished running LISA.'
+                } catch (exc) {
+                    println "LISA failed, will now archive logs and exit."
+                    result = 'FAILURE'
+                } finally {
+					junit "BIS\\WS2012R2\\lisa\\report.xml"
+                    currentBuild.result = result
+                }
+        }
+    }
+}
+
+
+
+
+

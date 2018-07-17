@@ -1,0 +1,222 @@
+#!/usr/bin/env groovy
+
+kernelTree = "https://github.com/freebsd/freebsd.git"
+
+env.buildDir = "/usr/devsrc/"
+env.cloneDir = "freebsd"
+
+// pipelineName = "Freebsd-kernel-bisect-commit-validator/" + env.BRANCH_NAME
+pipelineName = "Freebsd-kernel-bisect-commit-validator/test" 
+
+
+isPerf = false
+def float left = 0
+
+properties ([
+    overrideIndexTriggers(false),
+    [$class: 'ParametersDefinitionProperty',
+        parameterDefinitions: [
+        [$class: 'StringParameterDefinition',
+            name: 'KERNEL_GIT_BRANCH',
+            defaultValue: 'master',
+            description: 'Branch to be built'],
+        [$class: 'StringParameterDefinition',
+            name: 'GOOD_COMMIT',
+            defaultValue: 'a18fc3520b25ff0999f0de51',
+            description: 'Good commit (this goes back)'],
+        [$class: 'StringParameterDefinition',
+            name: 'BAD_COMMIT',
+            defaultValue: '6e36dd43eed2ff2a7f8ddc4b8d',
+            description: 'Bad commit (can be HEAD)'],
+        [$class: 'ChoiceParameterDefinition',
+            choices: 'Boot\n',
+            name: 'BISECT_TYPE',
+            description: 'Type of bisect that will be performed.']
+        ]
+    ]
+])
+
+
+isPerf = BISECT_TYPE.equals('Performance')
+
+node ("freebsdcurrentbisect") {
+    // we pull the code
+    initEnv()
+
+    // if the enabled stages also contain perf, we should set a base value for it
+    if (isPerf) {
+        // TODO
+    }
+
+    // we make sure the good commit is good and the bad one bad, so we avoid
+    // a useless bisect
+    stage("validate_commits") {
+        validateCommit(BAD_COMMIT, "FAILURE")
+        println("Bad commit " + BAD_COMMIT + " has been validated to be bad")
+    }
+
+    // start the bisect workflow
+    bisect()
+}
+
+
+def initEnv() {
+        stage ("initialize_env") {
+            def scriptFetch = sh(
+                    script: '''#!/bin/bash
+                        set -xe
+                        mkdir -p $buildDir
+                        pushd $buildDir
+                        if [[ ! -d $cloneDir ]];then
+                            git clone https://github.com/freebsd/freebsd.git $cloneDir
+                            pushd $cloneDir
+                                git config --global gc.auto 0
+                            popd
+                        fi
+                        pushd $cloneDir
+                        git checkout -f $KERNEL_GIT_BRANCH
+                        git clean -x -f -d
+                        git reset --hard HEAD
+                        git fetch --all
+                        git pull
+                        popd
+                        popd
+                        '''
+            )
+            println "Finished cloning Git repo."
+        }    
+}
+
+
+
+def checkVariation(value) {
+    return value >= left ? "good" : "bad"
+}
+
+
+def validateCommit (String commit, String expectedState) {
+    if (!commit) {
+        println("Commit " + commit + " is not valid.")
+        sh(script: "exit 1")
+    }
+    job = buildJobWrapper(commit)
+    if (isPerf) {
+        res = checkVariation(job.perfResult)
+        if (res == "good" || job.buildResult == "FAILURE") {
+            println "Commit was not validated. Build result was " + job.buildResult + " and perf result was " + job.perfResult + " GB/s" 
+            currentBuild.result = 'FAILURE'
+            sh(script: "exit 1")
+        }
+    }
+    if (!isPerf && job.buildResult != expectedState) {
+        println "Commit " + commit + " was expected to be " + expectedState + " instead of " + job.buildResult
+        currentBuild.result = 'FAILURE'
+        sh(script: "exit 1")
+    }
+}
+
+String getCommit (String passed) {
+    env.passed = passed
+    def commit = sh(
+        script: '''#!/bin/bash
+                   set -xe
+                   pushd "$buildDir/$cloneDir" 2>&1 > /dev/null
+                   output=$(git bisect $passed)
+                   popd 2>&1 > /dev/null
+                   final=$(echo $output | grep 'first bad commit' | wc -l)
+                   commit_id=${output##*[}
+                   commit_id=${commit_id%%]*}
+                   if [[ "$final" != "0" ]]; then
+                       echo $output
+                       exit 0
+                   fi
+                   echo $commit_id
+                ''',
+        returnStdout: true
+    )
+    if (commit.contains("first bad commit")) {
+        println("Bisect finished succesfully. Bad commit is " + commit.split(" ")[0])
+        currentBuild.displayName = "$BUILD_NUMBER-" + commit.substring(0,7)
+        return ""
+    }
+    return commit.trim()
+}
+
+
+def bisect () {
+    String commitId = ""
+    String passed = ""
+
+    sh(
+        script: '''#!/bin/bash
+                   set -xe
+
+                   pushd "$buildDir/$cloneDir"
+                   printf "Bisect Graph is the following:"
+                   git rev-list --graph --oneline $BAD_COMMIT --not "${GOOD_COMMIT}"
+                   popd
+                '''
+    )
+
+    def firstCommit = sh(
+        script: '''#!/bin/bash
+                   set -xe
+                   pushd "$buildDir/$cloneDir" 2>&1 > /dev/null
+                   output=$(git bisect start $BAD_COMMIT "$GOOD_COMMIT")
+                   output=${output%%]*}
+                   output=${output##*[}
+                   echo $output
+                   popd 2>&1 > /dev/null
+                ''',
+        returnStdout: true
+    )
+
+    commitId = firstCommit.trim()
+    println "First commit is : " + commitId
+
+    while (true) {
+        stage("bisect " + commitId.substring(0,7)) {
+            job = buildJobWrapper(commitId)
+            if (isPerf) {
+                if (job.buildResult == "SUCCESS") {
+                    println "Current commit Id is " + commitId + " and value is " + job.perfResult + " GB/s"
+                    passed = checkVariation(job.perfResult)
+                } else {
+                    println "Current commit Id is " + commitId + ". Commit failed and we skip it."
+                    passed = "skip"
+                }
+            } else {
+                if (job.buildResult == 'SUCCESS') {
+                    passed = 'good'
+                } else if (job.buildResult == 'FAILURE') {
+                    passed = 'bad'
+                }
+            }
+        }
+        commitId = getCommit(passed)
+        if (commitId == "") {
+            break
+        }
+    }
+}
+
+def buildJobWrapper(String commit) {
+    if (!commit) {
+        println("Commit " + commit + " is not valid.")
+        sh(script: "exit 1")
+    }
+	
+     def buildResult = build job: pipelineName, parameters: [string(name: 'KERNEL_GIT_URL', value: kernelTree),
+                                                            string(name: 'KERNEL_GIT_BRANCH', value: KERNEL_GIT_BRANCH),
+                                                            string(name: 'KERNEL_GIT_COMMIT_ID', value: commit),
+                                                            string(name: 'BISECT_TYPE', value: BISECT_TYPE)],
+                                                            propagate: false,
+                                                            wait: true
+
+    return ["buildResult": buildResult.result]
+	
+}
+
+currentBuild.displayName
+
+
