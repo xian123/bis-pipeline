@@ -2,7 +2,8 @@
 
 kernelTree = "https://github.com/freebsd/freebsd.git"
 
-env.buildDir = "/usr/devsrc/"
+//env.buildDir = "/usr/devsrc/"
+env.buildDir = "/tmp/devsrc/"
 env.cloneDir = "freebsd"
 
 // pipelineName = "Freebsd-kernel-bisect-commit-validator/" + env.BRANCH_NAME
